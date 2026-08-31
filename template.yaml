@@ -1,0 +1,1423 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploys an automated session transcript analysis pipeline for AWS Systems
+  Manager Session Manager. When a session ends, transcripts are analyzed using
+  Amazon Bedrock and classified as Normal, Suspicious, or Critical. Results are
+  stored in DynamoDB and alerts sent via SNS. Includes a natural language query
+  interface using Amazon Bedrock AgentCore for on-demand investigation of session
+  activity, CloudWatch Logs, and CloudTrail API history. All data is encrypted
+  with KMS. You are responsible for ensuring compliance with applicable
+  regulations when deploying in environments that handle regulated data.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Notification Configuration
+        Parameters:
+          - NotificationProtocol
+          - NotificationEndpoint
+      - Label:
+          default: Model Configuration
+        Parameters:
+          - AnalysisModelId
+    ParameterLabels:
+      NotificationProtocol:
+        default: Alert notification protocol
+      NotificationEndpoint:
+        default: Alert notification endpoint
+      AnalysisModelId:
+        default: Bedrock model for session analysis
+
+Parameters:
+  NotificationProtocol:
+    Type: String
+    Default: email
+    AllowedValues:
+      - email
+      - email-json
+      - https
+      - lambda
+    Description: Protocol for SNS alert notifications.
+
+  NotificationEndpoint:
+    Type: CommaDelimitedList
+    Description: One or more notification endpoints separated by commas, matching the selected protocol. Confirm email subscriptions after deployment.
+
+  AnalysisModelId:
+    Type: String
+    Default: global.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      Amazon Bedrock inference profile ID for session analysis.
+      The default (global.anthropic.claude-haiku-4-5-20251001-v1:0) works in all regions.
+
+Resources:
+
+  # ============================================================
+  # KMS Key — Encryption for all resources
+  # ============================================================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts session transcripts in S3, summaries in DynamoDB, alerts in SNS, dead-letter queues in SQS, and session logs in CloudWatch
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Root account access enables key administration. Review and restrict
+          # actions such as ScheduleKeyDeletion for production workloads.
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Get*'
+              - 'kms:TagResource'
+              - 'kms:UntagResource'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+              - 'kms:DeleteAlias'
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+          - Sid: AllowSNSService
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - 'kms:GenerateDataKey*'
+              - 'kms:Decrypt'
+            Resource: '*'
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/ssm-session-anomaly-${AWS::StackName}'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ============================================================
+  # S3 Logging Bucket (receives access logs from transcript bucket)
+  # ============================================================
+  # Receives S3 server access logs from the transcript bucket for audit purposes
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketName: !Sub
+        - 'ssm-session-logs-${Guid}'
+        - Guid: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Sub
+          - 'ssm-session-logs-${Guid}'
+          - Guid: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+        LogFilePrefix: self-logs/
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTLSRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LoggingBucket.Arn
+              - !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowS3LogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # ============================================================
+  # S3 Bucket — Session transcripts (Object Lock + Versioning + KMS)
+  # ============================================================
+  # ============================================================
+  # Stores session transcript files uploaded by SSM Agent when a session ends, triggering the analysis pipeline
+  SessionTranscriptBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: 30
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: session-logs-access/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldTranscripts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  # ============================================================
+  # S3 Bucket Policy — HTTPS only (uses !Ref for scanner cross-reference)
+  # ============================================================
+  SessionTranscriptBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_SSL_REQUESTS_ONLY
+    Properties:
+      Bucket: !Ref SessionTranscriptBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SessionTranscriptBucket.Arn
+              - !Sub '${SessionTranscriptBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ============================================================
+  # Custom Resource — Apply S3 Notification after bucket + Lambda exist
+  # ============================================================
+  S3NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  S3NotificationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref S3NotificationRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:PutBucketNotification'
+            Resource: !GetAtt SessionTranscriptBucket.Arn
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Sid: DLQSend
+            Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt AnalyzerDLQ.Arn
+
+  S3NotificationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: S3NotificationPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt S3NotificationRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt AnalyzerDLQ.Arn
+      Tags:
+        - Key: NetworkPlacement
+          Value: public-endpoint-only
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      bucket = event['ResourceProperties']['BucketName']
+                      lambda_arn = event['ResourceProperties']['LambdaArn']
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={
+                              'LambdaFunctionConfigurations': [{
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {'Name': 'prefix', 'Value': 'session-logs/'},
+                                              {'Name': 'suffix', 'Value': '.log'}
+                                          ]
+                                      }
+                                  }
+                              }]
+                          }
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      bucket = event['ResourceProperties']['BucketName']
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  ApplyS3Notification:
+    Type: Custom::S3Notification
+    DependsOn:
+      - SessionAnalyzerS3Permission
+      - SessionTranscriptBucket
+      - SessionAnalyzerFunction
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      BucketName: !Ref SessionTranscriptBucket
+      LambdaArn: !GetAtt SessionAnalyzerFunction.Arn
+
+  SessionAnalyzerS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SessionAnalyzerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt SessionTranscriptBucket.Arn
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # ============================================================
+  # CloudWatch Log Group — Encrypted with KMS
+  # ============================================================
+  # Receives real-time session command streams from SSM Agent for on-demand log queries
+  SessionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/ssm/session-logs
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  # ============================================================
+  # DynamoDB Table — Encrypted with KMS
+  # ============================================================
+  # Stores AI-generated session analysis results including classification, security flags, user identity, and source IP
+  SessionSummaryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'SSMSessionSummaries-${AWS::StackName}'
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt EncryptionKey.Arn
+
+  # ============================================================
+  # SNS Topic — Encrypted with KMS
+  # ============================================================
+  # Sends notifications to SOC team when a session is classified as Suspicious or Critical
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SSM Session Security Alerts
+      TopicName: !Sub 'ssm-session-alerts-${AWS::StackName}'
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  AlertSubscription:
+    Type: Custom::SNSSubscriptions
+    Properties:
+      ServiceToken: !GetAtt SNSSubscriptionFunction.Arn
+      TopicArn: !Ref AlertTopic
+      Protocol: !Ref NotificationProtocol
+      Endpoints: !Ref NotificationEndpoint
+
+  SNSSubscriptionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  SNSSubscriptionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref SNSSubscriptionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SNSSubscribe
+            Effect: Allow
+            Action:
+              - 'sns:Subscribe'
+              - 'sns:Unsubscribe'
+            Resource: !Ref AlertTopic
+          - Sid: LambdaLogging
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Sid: DLQSend
+            Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt AnalyzerDLQ.Arn
+
+  SNSSubscriptionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SNSSubscriptionPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt SNSSubscriptionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Tags:
+        - Key: NetworkPlacement
+          Value: public-endpoint-only
+      DeadLetterConfig:
+        TargetArn: !GetAtt AnalyzerDLQ.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          sns = boto3.client('sns')
+
+          def handler(event, context):
+              try:
+                  topic_arn = event['ResourceProperties']['TopicArn']
+                  protocol = event['ResourceProperties']['Protocol']
+                  endpoints = event['ResourceProperties']['Endpoints']
+                  if event['RequestType'] in ['Create', 'Update']:
+                      for endpoint in endpoints:
+                          endpoint = endpoint.strip()
+                          if endpoint:
+                              sns.subscribe(
+                                  TopicArn=topic_arn,
+                                  Protocol=protocol,
+                                  Endpoint=endpoint
+                              )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': type(e).__name__})
+
+  # ============================================================
+  # SQS Dead Letter Queue for Lambda
+  # ============================================================
+  AnalyzerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  QueryExecutorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # ============================================================
+  # Module 1: Session Analyzer IAM Role (Managed Policy)
+  # ============================================================
+  SessionAnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role for the session analyzer Lambda that reads transcripts, invokes Bedrock, and writes to DynamoDB and SNS
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  SessionAnalyzerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_POLICYDOCUMENT_NO_WILDCARD_RESOURCE
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: >-
+              cloudtrail:LookupEvents does not support resource-level permissions
+              per AWS documentation. Resource * is required.
+    Properties:
+      Roles:
+        - !Ref SessionAnalyzerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaLogging
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Sid: S3ReadTranscript
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+            Resource: !Sub '${SessionTranscriptBucket.Arn}/*'
+          # ssm:DescribeSessions requires account-wide resource scope because
+          # it is a list/filter operation that cannot be scoped to a specific session
+          # ARN at call time. The session ID filter is applied server-side after authorization.
+          - Sid: SSMDescribeSession
+            Effect: Allow
+            Action:
+              - 'ssm:DescribeSessions'
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action:
+              - 'bedrock:InvokeModel'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-haiku*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+          - Sid: DynamoDBWrite
+            Effect: Allow
+            Action:
+              - 'dynamodb:PutItem'
+            Resource: !GetAtt SessionSummaryTable.Arn
+          - Sid: SNSPublish
+            Effect: Allow
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref AlertTopic
+          - Sid: KMSDecrypt
+            Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: !GetAtt EncryptionKey.Arn
+          - Sid: DLQSend
+            Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt AnalyzerDLQ.Arn
+          - Sid: CloudTrailLookup
+            Effect: Allow
+            Action:
+              - 'cloudtrail:LookupEvents'
+            Resource: '*'
+
+  # ============================================================
+  # Module 1: Session Analyzer Lambda
+  # ============================================================
+  SessionAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SessionAnalyzerPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      Description: Reads session transcripts from S3, retrieves user identity from SSM and CloudTrail, sends content to Bedrock for classification, stores results in DynamoDB, and alerts via SNS
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt SessionAnalyzerRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50
+      Tags:
+        - Key: NetworkPlacement
+          Value: public-endpoint-only
+      DeadLetterConfig:
+        TargetArn: !GetAtt AnalyzerDLQ.Arn
+      Environment:
+        Variables:
+          SUMMARY_TABLE: !Ref SessionSummaryTable
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          MODEL_ID: !Ref AnalysisModelId
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import time
+          import boto3
+          import urllib.parse
+          from datetime import datetime, timezone
+          from botocore.config import Config
+
+          s3_client = boto3.client('s3')
+          ssm_client = boto3.client('ssm')
+          bedrock_client = boto3.client('bedrock-runtime', config=Config(retries={'max_attempts': 4, 'mode': 'adaptive'}))
+          dynamodb = boto3.resource('dynamodb')
+          sns_client = boto3.client('sns')
+          cloudtrail_client = boto3.client('cloudtrail')
+
+          TABLE_NAME = os.environ['SUMMARY_TABLE']
+          ALERT_TOPIC_ARN = os.environ['ALERT_TOPIC_ARN']
+          MODEL_ID = os.environ['MODEL_ID']
+
+          MAX_READ_BYTES = 2 * 1024 * 1024
+          MAX_ANALYSIS_CHARS = 100000
+          HALF_WINDOW = MAX_ANALYSIS_CHARS // 2
+          MAX_OUTPUT_BLOCK = 800
+          ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+          def lambda_handler(event, context):
+              for s3_record in event.get('Records', []):
+                  bucket = s3_record['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(s3_record['s3']['object']['key'])
+                  process_object(bucket, key)
+              return {'statusCode': 200, 'body': 'Processed'}
+
+
+          def process_object(bucket, key):
+              session_id = key.split('/')[-1].replace('.log', '')
+
+              session_log = read_transcript(bucket, key)
+              user, target, source_ip = get_session_metadata(session_id)
+
+              if not session_log:
+                  analysis = {
+                      'classification': 'Needs Review',
+                      'summary': 'Session transcript was empty or could not be read. Manual review required.',
+                      'flags': ['transcript_unreadable'],
+                      'recommendation': 'Inspect the raw transcript object in S3 and the analyzer CloudWatch logs.'
+                  }
+                  store_summary(session_id, user, target, source_ip, analysis)
+                  send_alert(session_id, user, target, source_ip, analysis)
+                  return
+
+              analysis = analyze_session(session_id, user, target, condense_transcript(session_log))
+              store_summary(session_id, user, target, source_ip, analysis)
+
+              if analysis.get('classification') in ['Suspicious', 'Critical', 'Needs Review']:
+                  send_alert(session_id, user, target, source_ip, analysis)
+
+
+          def read_transcript(bucket, key):
+              try:
+                  response = s3_client.get_object(Bucket=bucket, Key=key, Range=f'bytes=0-{MAX_READ_BYTES - 1}')
+                  content = response['Body'].read().decode('utf-8', errors='replace')
+                  if content.strip():
+                      return content
+              except Exception as e:
+                  print(f"Error reading transcript: {type(e).__name__}")
+              return None
+
+
+          def condense_transcript(text):
+              text = ANSI_RE.sub('', text).replace('\r', '')
+              lines = []
+              for line in text.split('\n'):
+                  if len(line) > MAX_OUTPUT_BLOCK:
+                      lines.append(line[:MAX_OUTPUT_BLOCK] + ' ...[output truncated]')
+                  else:
+                      lines.append(line)
+              condensed = '\n'.join(lines)
+              if len(condensed) > MAX_ANALYSIS_CHARS:
+                  condensed = condensed[:HALF_WINDOW] + '\n\n...[middle of session omitted for length]...\n\n' + condensed[-HALF_WINDOW:]
+              return condensed
+
+
+          def get_session_metadata(session_id):
+              user = 'unknown'
+              target = 'unknown'
+              source_ip = 'unknown'
+              try:
+                  response = ssm_client.describe_sessions(
+                      State='History',
+                      Filters=[{'key': 'SessionId', 'value': session_id}]
+                  )
+                  sessions = response.get('Sessions', [])
+                  if sessions:
+                      session = sessions[0]
+                      user = session.get('Owner', 'unknown').split('/')[-1]
+                      target = session.get('Target', 'unknown')
+              except Exception as e:
+                  print(f"Error getting session metadata: {type(e).__name__}")
+              if user == 'unknown' or source_ip == 'unknown':
+                  try:
+                      time.sleep(40)
+                      ct_response = cloudtrail_client.lookup_events(
+                          LookupAttributes=[{
+                              'AttributeKey': 'EventName',
+                              'AttributeValue': 'StartSession'
+                          }],
+                          MaxResults=50
+                      )
+                      for event in ct_response.get('Events', []):
+                          detail = json.loads(event.get('CloudTrailEvent', '{}'))
+                          req_params = detail.get('requestParameters', {})
+                          if req_params.get('target', '') == target or session_id in json.dumps(detail):
+                              user_identity = detail.get('userIdentity', {})
+                              if user == 'unknown':
+                                  user = user_identity.get('arn', user_identity.get('userName', 'unknown'))
+                              source_ip = detail.get('sourceIPAddress', 'unknown')
+                              break
+                  except Exception as e:
+                      print(f"Error looking up CloudTrail: {type(e).__name__}")
+              return user, target, source_ip
+
+
+          def analyze_session(session_id, user, target, session_log):
+              prompt = f"""You are a security analyst reviewing an AWS Systems Manager Session Manager session transcript. The transcript contains both user-typed commands and their system output intermixed.
+
+          Session ID: {session_id}
+          User: {user}
+          Target Node: {target}
+
+          === SESSION TRANSCRIPT ===
+          {session_log}
+          === END TRANSCRIPT ===
+
+          Analyze this session and respond with ONLY a JSON object:
+          {{
+            "classification": "Normal|Suspicious|Critical",
+            "summary": "2-3 sentence summary of what the user did",
+            "flags": ["list of security-relevant patterns observed"],
+            "recommendation": "Recommended follow-up action for the SOC team"
+          }}
+
+          Classification rules (apply to Linux, Windows/PowerShell, and macOS sessions):
+          - Normal: Routine administration - checking disk/memory/service status, reading OS configs, deployments, viewing logs. Examples: Linux systemctl/journalctl; Windows Get-Service/Get-EventLog; macOS launchctl/log show.
+          - Suspicious: Deliberately accessing credential stores (Linux /etc/shadow; Windows SAM/lsass/registry hives; macOS /etc/master.passwd, Keychain, security dump-keychain), enumerating privilege-escalation vectors, transferring data to external hosts (curl/wget/Invoke-WebRequest), clearing command history (history -c / Clear-History).
+          - Critical: Extracting credentials, installing persistence (cron/systemd, scheduled tasks/registry Run keys, launchd), disabling security controls, active data exfiltration.
+
+          When classifying, determine which actions the user deliberately performed in this session. If a security-relevant keyword (such as /etc/shadow or a credential path) appears only inside system output, log entries, journal lines, or service status responses and was not a command the user typed, do not use it as the basis for classification. The user running systemctl status, journalctl, or the Windows/macOS equivalents and seeing historical log entries about prior activity is Normal system administration.
+
+          Return ONLY valid JSON."""
+
+              body = json.dumps({
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 1024,
+                  "messages": [{"role": "user", "content": prompt}]
+              })
+
+              try:
+                  response = bedrock_client.invoke_model(
+                      modelId=MODEL_ID, body=body,
+                      contentType='application/json', accept='application/json'
+                  )
+                  response_body = json.loads(response['body'].read())
+                  content = response_body['content'][0]['text']
+                  start = content.find('{')
+                  end = content.rfind('}') + 1
+                  if start != -1 and end > start:
+                      return json.loads(content[start:end])
+                  return json.loads(content)
+              except json.JSONDecodeError:
+                  return {"classification": "Unknown", "summary": "Could not parse model response", "flags": ["parse_error"], "recommendation": "Manual review required - model response was not valid JSON"}
+              except Exception as e:
+                  print(f"Bedrock error: {type(e).__name__}")
+                  return {"classification": "Unknown", "summary": f"Analysis failed: {type(e).__name__}", "flags": ["analysis_error"], "recommendation": "Manual review required - analysis pipeline error"}
+
+
+          def store_summary(session_id, user, target, source_ip, analysis):
+              table = dynamodb.Table(TABLE_NAME)
+              table.put_item(Item={
+                  'sessionId': session_id,
+                  'timestamp': datetime.now(timezone.utc).isoformat(),
+                  'user': user, 'target': target, 'sourceIp': source_ip,
+                  'classification': analysis.get('classification', 'Unknown'),
+                  'summary': analysis.get('summary', ''),
+                  'flags': analysis.get('flags', []),
+                  'recommendation': analysis.get('recommendation', '')
+              })
+              print(f"Summary stored successfully")
+
+
+          def send_alert(session_id, user, target, source_ip, analysis):
+              classification = analysis.get('classification', 'Unknown')
+              subject = f"[{classification}] SSM Session Alert: {user} on {target}"
+              flags_text = ', '.join(analysis.get('flags', ['None']))
+              message = (
+                  f"SSM SESSION SECURITY ALERT\n"
+                  f"{'=' * 40}\n"
+                  f"Classification : {classification}\n"
+                  f"Session ID     : {session_id}\n"
+                  f"User           : {user}\n"
+                  f"Source IP      : {source_ip}\n"
+                  f"Target Node    : {target}\n"
+                  f"Time (UTC)     : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                  f"SUMMARY:\n{analysis.get('summary', 'N/A')}\n\n"
+                  f"FLAGS:\n{flags_text}\n\n"
+                  f"RECOMMENDATION:\n{analysis.get('recommendation', 'N/A')}\n"
+                  f"{'=' * 40}"
+              )
+              sns_client.publish(TopicArn=ALERT_TOPIC_ARN, Subject=subject[:100], Message=message)
+              print(f"Alert published successfully")
+
+  # ============================================================
+  # Module 2: Query Executor IAM Role (Managed Policy)
+  # ============================================================
+  QueryExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role for the query executor Lambda that queries CloudWatch Logs, DynamoDB, and CloudTrail
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  QueryExecutorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_POLICYDOCUMENT_NO_WILDCARD_RESOURCE
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: >-
+              cloudtrail:LookupEvents does not support resource-level permissions
+              per AWS documentation. Resource * is required.
+    Properties:
+      Roles:
+        - !Ref QueryExecutorRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaLogging
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Sid: SessionLogQuery
+            Effect: Allow
+            Action:
+              - 'logs:StartQuery'
+              - 'logs:GetQueryResults'
+              - 'logs:GetLogEvents'
+              - 'logs:DescribeLogStreams'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ssm/session-logs:*'
+          - Sid: DynamoDBRead
+            Effect: Allow
+            Action:
+              - 'dynamodb:Scan'
+              - 'dynamodb:Query'
+              - 'dynamodb:GetItem'
+            Resource: !GetAtt SessionSummaryTable.Arn
+          - Sid: KMSDecrypt
+            Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+            Resource: !GetAtt EncryptionKey.Arn
+          - Sid: DLQSend
+            Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt QueryExecutorDLQ.Arn
+          - Sid: CloudTrailLookup
+            Effect: Allow
+            Action:
+              - 'cloudtrail:LookupEvents'
+            Resource: '*'
+
+  # ============================================================
+  # Module 2: Query Executor Lambda
+  # ============================================================
+  QueryExecutorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: QueryExecutorPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      Description: Executes queries from AgentCore harness against CloudWatch Logs, DynamoDB, and CloudTrail to return investigation results
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt QueryExecutorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      Tags:
+        - Key: NetworkPlacement
+          Value: public-endpoint-only
+      DeadLetterConfig:
+        TargetArn: !GetAtt QueryExecutorDLQ.Arn
+      Environment:
+        Variables:
+          SSM_LOG_GROUP: /aws/ssm/session-logs
+          SUMMARY_TABLE: !Ref SessionSummaryTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import boto3
+          from datetime import datetime, timezone, timedelta
+
+          logs_client = boto3.client('logs')
+          dynamodb_client = boto3.client('dynamodb')
+          cloudtrail_client = boto3.client('cloudtrail')
+
+          LOG_GROUP = os.environ['SSM_LOG_GROUP']
+          TABLE_NAME = os.environ['SUMMARY_TABLE']
+
+
+          def lambda_handler(event, context):
+
+              if 'apiPath' in event:
+                  api_path = event.get('apiPath', '')
+                  parameters = event.get('parameters', [])
+                  params = {}
+                  for p in parameters:
+                      params[p['name']] = p['value']
+              else:
+                  params = event
+                  if 'query' in params:
+                      api_path = '/query-sessions'
+                  elif 'username' in params:
+                      api_path = '/search-user'
+                  elif 'eventName' in params or 'lookupAttribute' in params:
+                      api_path = '/lookup-cloudtrail'
+                  else:
+                      api_path = '/get-summaries'
+
+              if api_path == '/query-sessions':
+                  result = query_sessions(params)
+              elif api_path == '/get-summaries':
+                  result = get_summaries(params)
+              elif api_path == '/search-user':
+                  result = search_user_sessions(params)
+              elif api_path == '/lookup-cloudtrail':
+                  result = lookup_cloudtrail(params)
+              else:
+                  result = {"error": f"Unknown path: {api_path}"}
+
+              return result
+
+
+          def query_sessions(params):
+              query_string = params.get('query', '')
+              hours_back = int(params.get('hoursBack', '168'))
+              if not query_string:
+                  return {"error": "Missing 'query' parameter"}
+              end_time = int(datetime.now(timezone.utc).timestamp())
+              start_time = end_time - (hours_back * 3600)
+              try:
+                  response = logs_client.start_query(
+                      logGroupName=LOG_GROUP, startTime=start_time,
+                      endTime=end_time, queryString=query_string, limit=100
+                  )
+                  query_id = response['queryId']
+                  for _ in range(30):
+                      result = logs_client.get_query_results(queryId=query_id)
+                      if result['status'] in ['Complete', 'Failed', 'Cancelled']:
+                          break
+                      time.sleep(1)
+                  if result['status'] != 'Complete':
+                      return {"error": f"Query {result['status']}"}
+                  results = []
+                  for entry in result.get('results', [])[:50]:
+                      row = {}
+                      for field in entry:
+                          if field['field'] != '@ptr':
+                              row[field['field']] = field['value']
+                      results.append(row)
+                  return {"status": "success", "resultCount": len(results), "results": results}
+              except Exception as e:
+                  return {"error": type(e).__name__}
+
+
+          def get_summaries(params):
+              classification = params.get('classification', None)
+              hours_back = int(params.get('hoursBack', '168'))
+              cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+              try:
+                  scan_params = {
+                      'TableName': TABLE_NAME,
+                      'FilterExpression': '#ts > :cutoff',
+                      'ExpressionAttributeNames': {'#ts': 'timestamp'},
+                      'ExpressionAttributeValues': {':cutoff': {'S': cutoff}}
+                  }
+                  if classification:
+                      scan_params['FilterExpression'] += ' AND classification = :cls'
+                      scan_params['ExpressionAttributeValues'][':cls'] = {'S': classification}
+                  response = dynamodb_client.scan(**scan_params)
+                  items = []
+                  for item in response.get('Items', [])[:50]:
+                      items.append({
+                          'sessionId': item.get('sessionId', {}).get('S', ''),
+                          'timestamp': item.get('timestamp', {}).get('S', ''),
+                          'user': item.get('user', {}).get('S', ''),
+                          'target': item.get('target', {}).get('S', ''),
+                          'classification': item.get('classification', {}).get('S', ''),
+                          'summary': item.get('summary', {}).get('S', ''),
+                          'flags': [f.get('S', '') for f in item.get('flags', {}).get('L', [])]
+                      })
+                  return {"status": "success", "resultCount": len(items), "summaries": items}
+              except Exception as e:
+                  return {"error": type(e).__name__}
+
+
+          def search_user_sessions(params):
+              username = params.get('username', '')
+              hours_back = int(params.get('hoursBack', '168'))
+              if not username:
+                  return {"error": "Missing 'username' parameter"}
+              cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+              try:
+                  response = dynamodb_client.scan(
+                      TableName=TABLE_NAME,
+                      FilterExpression='contains(#u, :user) AND #ts > :cutoff',
+                      ExpressionAttributeNames={'#u': 'user', '#ts': 'timestamp'},
+                      ExpressionAttributeValues={':user': {'S': username}, ':cutoff': {'S': cutoff}}
+                  )
+                  items = []
+                  for item in response.get('Items', []):
+                      items.append({
+                          'sessionId': item.get('sessionId', {}).get('S', ''),
+                          'timestamp': item.get('timestamp', {}).get('S', ''),
+                          'target': item.get('target', {}).get('S', ''),
+                          'classification': item.get('classification', {}).get('S', ''),
+                          'summary': item.get('summary', {}).get('S', ''),
+                          'flags': [f.get('S', '') for f in item.get('flags', {}).get('L', [])]
+                      })
+                  return {"status": "success", "user": username, "resultCount": len(items), "sessions": items}
+              except Exception as e:
+                  return {"error": type(e).__name__}
+
+
+          def lookup_cloudtrail(params):
+              lookup_attribute = params.get('lookupAttribute', 'EventName')
+              lookup_value = params.get('lookupValue', '')
+              hours_back = int(params.get('hoursBack', '24'))
+              if not lookup_value:
+                  return {"error": "Missing 'lookupValue' parameter"}
+              end_time = datetime.now(timezone.utc)
+              start_time = end_time - timedelta(hours=hours_back)
+              try:
+                  response = cloudtrail_client.lookup_events(
+                      LookupAttributes=[{
+                          'AttributeKey': lookup_attribute,
+                          'AttributeValue': lookup_value
+                      }],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      MaxResults=50
+                  )
+                  events = []
+                  for event in response.get('Events', []):
+                      detail = json.loads(event.get('CloudTrailEvent', '{}'))
+                      events.append({
+                          'eventTime': event.get('EventTime', '').isoformat() if hasattr(event.get('EventTime', ''), 'isoformat') else str(event.get('EventTime', '')),
+                          'eventName': event.get('EventName', ''),
+                          'eventSource': detail.get('eventSource', ''),
+                          'userIdentity': detail.get('userIdentity', {}).get('arn', detail.get('userIdentity', {}).get('userName', 'unknown')),
+                          'sourceIPAddress': detail.get('sourceIPAddress', ''),
+                          'awsRegion': detail.get('awsRegion', ''),
+                          'requestParameters': json.dumps(detail.get('requestParameters', {}))[:500],
+                          'responseElements': json.dumps(detail.get('responseElements', {}))[:200]
+                      })
+                  return {"status": "success", "resultCount": len(events), "events": events}
+              except Exception as e:
+                  return {"error": type(e).__name__}
+
+  # ============================================================
+  # SSM Document — Session Manager Preferences (Encrypted)
+  # ============================================================
+  SessionManagerPreferences:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: SSM-SessionManagerRunShell
+      DocumentType: Session
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '1.0'
+        description: >
+          Session Manager preferences with encrypted S3 transcript logging
+          and CloudWatch streaming for AI-powered anomaly detection.
+        sessionType: Standard_Stream
+        inputs:
+          kmsKeyId: !GetAtt EncryptionKey.Arn
+          s3BucketName: !Ref SessionTranscriptBucket
+          s3KeyPrefix: session-logs
+          s3EncryptionEnabled: true
+          cloudWatchLogGroupName: /aws/ssm/session-logs
+          cloudWatchEncryptionEnabled: true
+          cloudWatchStreamingEnabled: true
+
+  # ============================================================
+  # Module 2: AgentCore Gateway + Harness
+  # ============================================================
+  AgentCoreGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role for the AgentCore gateway that invokes the query executor Lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  AgentCoreGatewayPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref AgentCoreGatewayRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: InvokeLambdaTarget
+            Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource: !GetAtt QueryExecutorFunction.Arn
+          - Sid: GetGateway
+            Effect: Allow
+            Action:
+              - 'bedrock-agentcore:GetGateway'
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/ssm-gw-*'
+
+  AgentCoreGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    DependsOn: AgentCoreGatewayPolicy
+    Properties:
+      Name: !Sub
+        - 'ssm-gw-${Guid}'
+        - Guid: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt AgentCoreGatewayRole.Arn
+      ProtocolType: MCP
+      Description: Routes tool requests from the AgentCore harness to the query executor Lambda function
+
+  AgentCoreGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: AgentCoreGateway
+    Properties:
+      GatewayIdentifier: !Ref AgentCoreGateway
+      Name: ssmquerytarget
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt QueryExecutorFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: querySessions
+                  Description: Run a CloudWatch Logs Insights query against SSM session logs. Use @message field for command content.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      query:
+                        Type: string
+                        Description: CloudWatch Logs Insights query. Use @message for command content.
+                      hoursBack:
+                        Type: string
+                        Description: Hours of history to search (default 168)
+                    Required:
+                      - query
+                - Name: getSummaries
+                  Description: Get AI-generated session summaries from DynamoDB. Optionally filter by classification.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      classification:
+                        Type: string
+                        Description: Filter by Normal, Suspicious, or Critical
+                      hoursBack:
+                        Type: string
+                        Description: Hours of history to search (default 168)
+                - Name: searchUserSessions
+                  Description: Search session summaries for a specific user.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      username:
+                        Type: string
+                        Description: Username to search for
+                      hoursBack:
+                        Type: string
+                        Description: Hours of history to search (default 168)
+                    Required:
+                      - username
+                - Name: lookupCloudTrail
+                  Description: Search AWS CloudTrail for API calls. Filter by EventName, Username, ResourceType, ResourceName, or EventSource. Returns who did what in AWS and from where.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      lookupAttribute:
+                        Type: string
+                        Description: Filter type. One of EventName, Username, ResourceType, ResourceName, EventSource, ReadOnly
+                      lookupValue:
+                        Type: string
+                        Description: Value to search for (e.g., StartSession, jsmith, AWS::EC2::Instance)
+                      hoursBack:
+                        Type: string
+                        Description: Hours of history to search (default 24)
+                    Required:
+                      - lookupAttribute
+                      - lookupValue
+
+  AgentCoreHarnessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM role for the AgentCore harness that invokes Bedrock models and the gateway
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  AgentCoreHarnessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref AgentCoreHarnessRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: InvokeModel
+            Effect: Allow
+            Action:
+              - 'bedrock:InvokeModel'
+              - 'bedrock:InvokeModelWithResponseStream'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-haiku*'
+              - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+          - Sid: InvokeGateway
+            Effect: Allow
+            Action:
+              - 'bedrock-agentcore:InvokeGateway'
+            Resource: !GetAtt AgentCoreGateway.GatewayArn
+          - Sid: HarnessMemory
+            Effect: Allow
+            Action:
+              - 'bedrock-agentcore:ListEvents'
+              - 'bedrock-agentcore:CreateEvent'
+              - 'bedrock-agentcore:DeleteEvent'
+              - 'bedrock-agentcore:GetEvent'
+              - 'bedrock-agentcore:RetrieveMemoryRecords'
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/*'
+
+  AgentCoreHarness:
+    Type: AWS::BedrockAgentCore::Harness
+    DependsOn:
+      - AgentCoreHarnessPolicy
+      - AgentCoreGatewayTarget
+    Properties:
+      HarnessName: SSMSecurityAnalyst
+      ExecutionRoleArn: !GetAtt AgentCoreHarnessRole.Arn
+      Model:
+        BedrockModelConfig:
+          ModelId: !Ref AnalysisModelId
+      SystemPrompt:
+        - Text: !Sub |
+            You are a security analyst assistant that helps SOC teams investigate AWS Systems Manager Session Manager sessions. You have access to session summaries stored in DynamoDB and raw session logs in CloudWatch.
+
+            When building CloudWatch Logs Insights queries, use @message as the field containing session command data. Do not use "command" as a field name.
+
+            Example query: fields @timestamp, @message | filter @message like /keyword/ | sort @timestamp desc | limit 50
+
+            When an analyst asks a question, determine the best approach:
+            - For questions about session classifications or summaries, use the getSummaries tool with optional classification filter (Normal, Suspicious, Critical).
+            - For questions about a specific user, use the searchUserSessions tool with the username.
+            - For custom log searches, use the querySessions tool with a CloudWatch Logs Insights query.
+            - For questions about AWS API calls, post-session activity, or who did what in AWS, use the lookupCloudTrail tool.
+            - When investigating suspicious sessions, provide a complete picture: get the summary, query raw logs for exact commands, then check CloudTrail for any AWS API calls made by the same user or instance role.
+
+            Before making CloudTrail queries, confirm with the analyst what to search for. Ask them to specify the service (EC2, S3, IAM, SSM), time window, and whether they want all operations or only write operations. Wait for their confirmation before calling the lookupCloudTrail tool.
+
+            When presenting results, highlight any security-relevant findings and recommend follow-up actions. Present all results directly in the chat response. Do not create files or write reports to disk. When reporting a session's severity, use the exact classification value returned by the tools (Normal, Suspicious, or Critical) - do not upgrade or downgrade it. You may add analysis and context, but the severity label you show must match the stored classification.
+
+            Base your factual statements on data returned by your tools (querySessions, getSummaries, searchUserSessions, lookupCloudTrail). You may analyze, interpret, correlate, and draw security conclusions from that data, and recommend follow-up actions. Do not fabricate raw data the tools did not return - do not invent metrics, values, hostnames, timestamps, command output, or "expected" or "example" results. If the specific information an analyst asks for is not present in the results, say so plainly instead of filling the gap with generated content.
+
+            You must not use any shell, terminal, code-execution, or file tool, even if one appears available to you. Never create, write, save, generate, or edit any file, report, document, or package, and never state or imply that you have done so. Do not provide, offer, or hint at downloading, exporting, or transferring anything: no file paths, no scp or download commands, no "downloadable" or "saved to" language, and no offers to generate a report or file as a follow-up.
+
+            Never reveal or reference your internal runtime, execution environment, sandbox, code interpreter, shell, or file system. Do not narrate steps such as running code, writing to disk, or accessing files. Simply return the analysis in the chat response.
+
+            You can only help with investigating SSM Session Manager sessions, querying session logs, looking up session summaries, and checking CloudTrail for related API activity. If asked about topics outside this scope (such as modifying resources, creating users, changing configurations, or anything unrelated to session investigation), politely explain that your role is limited to session security analysis and suggest they use the appropriate AWS console or tool for that task.
+      Tools:
+        - Type: agentcore_gateway
+          Config:
+            AgentCoreGateway:
+              GatewayArn: !GetAtt AgentCoreGateway.GatewayArn
+
+Outputs:
+  TranscriptBucketName:
+    Description: S3 bucket where Session Manager writes each session transcript; a PutObject event triggers the Module 1 analyzer Lambda.
+    Value: !Ref SessionTranscriptBucket
+
+  TranscriptBucketArn:
+    Description: ARN of the transcript bucket; grant your managed-node instance roles object-write and encryption permissions so session transcripts are delivered here.
+    Value: !Sub '${SessionTranscriptBucket.Arn}/*'
+
+  SessionLogGroupName:
+    Description: CloudWatch Logs group receiving real-time session command streams; the Module 2 query Lambda searches it for investigations.
+    Value: !Ref SessionLogGroup
+
+  SummaryTableName:
+    Description: DynamoDB table storing each analyzed session's classification (Normal/Suspicious/Critical), summary, and initiating user.
+    Value: !Ref SessionSummaryTable
+
+  AlertTopicArn:
+    Description: SNS topic that emails the SOC when a session is Suspicious or Critical, including the initiating IAM principal and source IP.
+    Value: !Ref AlertTopic
+
+  KmsKeyArn:
+    Description: Customer-managed KMS key that encrypts transcripts, summaries, alerts, and logs; managed-node instance roles need encryption permissions on this key.
+    Value: !GetAtt EncryptionKey.Arn
+
+  SessionAnalyzerArn:
+    Description: 'Module 1 Lambda: reads a transcript, resolves the user via SSM/CloudTrail, classifies it with Amazon Bedrock, writes DynamoDB, alerts via SNS.'
+    Value: !GetAtt SessionAnalyzerFunction.Arn
+
+  QueryExecutorArn:
+    Description: "Module 2 Lambda: runs the AgentCore harness's natural-language queries against DynamoDB, CloudWatch Logs, and CloudTrail."
+    Value: !GetAtt QueryExecutorFunction.Arn
+
+  AgentCoreHarnessArn:
+    Description: Amazon Bedrock AgentCore harness (the AI security analyst); open it in the console to query session history in natural language.
+    Value: !GetAtt AgentCoreHarness.Arn
+
+  AgentCoreGatewayId:
+    Description: AgentCore gateway that routes the harness's tool calls to the Module 2 query Lambda.
+    Value: !Ref AgentCoreGateway
+
+  InstanceRolePolicySnippet:
+    Description: Attach this policy snippet to your managed-node IAM roles to grant the S3, KMS, and CloudWatch access needed to stream and store session transcripts.
+    Value: !Sub |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "SSMSessionLogging",
+            "Effect": "Allow",
+            "Action": ["s3:PutObject", "s3:GetEncryptionConfiguration", "kms:GenerateDataKey*", "kms:Decrypt", "kms:Encrypt"],
+            "Resource": ["${SessionTranscriptBucket.Arn}", "${SessionTranscriptBucket.Arn}/*", "${EncryptionKey.Arn}"]
+          },
+          {
+            "Sid": "CloudWatchEncryptedLogs",
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
+            "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ssm/session-logs:*"
+          },
+          {
+            "Sid": "CloudWatchDescribeGroups",
+            "Effect": "Allow",
+            "Action": "logs:DescribeLogGroups",
+            "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+          }
+        ]
+      }

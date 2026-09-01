@@ -8,16 +8,17 @@ This repository accompanies the AWS blog post [AI-powered anomaly detection for 
 
 ## How it works
 
-The solution has two modules.
-
-- **Module 1 (automatic analysis).** When a session ends, Session Manager uploads the transcript to Amazon S3. An AWS Lambda function reads it, looks up the initiating identity and source IP in AWS CloudTrail, sends the content to Amazon Bedrock for classification (Normal, Suspicious, or Critical), stores a summary in Amazon DynamoDB, and publishes an Amazon SNS alert for Suspicious or Critical sessions.
-- **Module 2 (on-demand querying).** An Amazon Bedrock AgentCore harness answers natural-language questions about session history by querying Amazon DynamoDB, Amazon CloudWatch Logs, and AWS CloudTrail through a query executor Lambda function.
+The solution has two modules. Module 1 analyzes each session automatically when it ends: it reads the transcript from Amazon S3, looks up the initiating identity and source IP in AWS CloudTrail, classifies the session with Amazon Bedrock (Normal, Suspicious, or Critical), stores a summary in Amazon DynamoDB, and sends an Amazon SNS alert for Suspicious or Critical sessions. Module 2 lets your Security Operations Center (SOC) team query session history on demand, in plain language, through an Amazon Bedrock AgentCore harness backed by Amazon DynamoDB, Amazon CloudWatch Logs, and AWS CloudTrail. Together they cover both automatic detection and hands-on investigation.
 
 ## Prerequisites
 
+Before you deploy this solution, verify that you have the following:
+
 - An AWS account with permissions to deploy AWS CloudFormation stacks.
-- Access to an Amazon Bedrock foundation model (for example, Claude Haiku 4.5). See [Add or remove access to Amazon Bedrock foundation models](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
-- At least one managed node configured for Session Manager, with the `AmazonSSMManagedInstanceCore` managed policy on its IAM role. See [Setting up Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html). The solution grants the additional session-logging permissions for you (see [How managed nodes get logging permissions](#how-managed-nodes-get-logging-permissions)).
+- At least one managed node (Amazon EC2 instance or hybrid-activated server) with the SSM Agent installed and an IAM role that has the `AmazonSSMManagedInstanceCore` managed policy. The solution grants the additional session-logging permissions for you (see [How managed nodes get logging permissions](#how-managed-nodes-get-logging-permissions)).
+- Access to an Amazon Bedrock foundation model (Claude Haiku 4.5 or your preferred model). For instructions, see [Add or remove access to Amazon Bedrock foundation models](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
+
+Your managed nodes must be set up for Session Manager. That means the SSM Agent is installed, the node role has the required permissions, and the node has network access to the Systems Manager and Amazon S3 endpoints. Recent Amazon EC2 Amazon Linux and Windows AMIs already include the SSM Agent. For on-premises nodes and the full network and setup steps, see [Setting up Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html).
 
 ## Deploy
 

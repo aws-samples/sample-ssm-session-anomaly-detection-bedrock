@@ -8,8 +8,7 @@ This sample shows how to automatically analyze AWS Systems Manager Session Manag
 
 The solution has two modules.
 
-- **Module 1 (automatic analysis).** When a session ends, Session Manager uploads the transcript to Amazon S3. An AWS Lambda function reads it, looks up the initiating identity and source IP in AWS CloudTrail, sends the content to Amazon Bedrock for classification (Normal, Suspicious, or Critical), stores a summary in Amazon DynamoDB, and publishes an Amazon SNS alert for Suspicious or Critical sessions.
-- **Module 2 (on-demand querying).** An Amazon Bedrock AgentCore harness answers natural-language questions about session history by querying Amazon DynamoDB, Amazon CloudWatch Logs, and AWS CloudTrail through a query executor Lambda function.
+The solution has two modules. Module 1 analyzes each session automatically when it ends and flags anything Suspicious or Critical. Module 2 lets your Security Operations Center (SOC) team query session history on demand, in plain language. Together they cover both automatic detection and hands-on investigation.
 
 ## Prerequisites
 

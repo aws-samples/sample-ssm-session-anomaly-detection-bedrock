@@ -2,7 +2,7 @@
 
 This sample shows how to automatically analyze AWS Systems Manager Session Manager transcripts using Amazon Bedrock. It classifies each session, alerts your security team on suspicious activity, and lets analysts query session history in natural language through Amazon Bedrock AgentCore.
 
-This repository accompanies the AWS blog post [AI-powered anomaly detection for AWS Systems Manager Session Manager logs](<BLOG_POST_URL>).
+
 
 ## How it works
 

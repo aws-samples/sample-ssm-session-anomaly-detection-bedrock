@@ -51,6 +51,22 @@ Parameters:
       Amazon Bedrock inference profile ID for session analysis.
       The default (global.anthropic.claude-haiku-4-5-20251001-v1:0) works in all regions.
 
+  RolePermissionAutomationSchedule:
+    Type: String
+    Default: rate(30 minutes)
+    AllowedValues:
+      - rate(30 minutes)
+      - rate(1 hour)
+      - rate(6 hours)
+      - rate(12 hours)
+      - rate(1 day)
+    Description: >
+      How often the State Manager association reconciles managed-node permissions,
+      attaching the session-logging policy to the IAM role of every managed node
+      (EC2 instance-profile roles and hybrid activation roles) so new nodes are
+      granted automatically. State Manager rate-based associations have a 30-minute
+      minimum interval.
+
 Resources:
 
   # ============================================================
@@ -1354,6 +1370,177 @@ Resources:
             AgentCoreGateway:
               GatewayArn: !GetAtt AgentCoreGateway.GatewayArn
 
+  # ============================================================
+  # Automated node-permission grant (State Manager association)
+  # Attaches the session-logging policy to every managed node's IAM
+  # role automatically, so no manual per-role step is required.
+  # ============================================================
+
+  # The exact permissions a managed node needs to deliver transcripts and
+  # stream session logs. Scoped to this stack's bucket, key, and log group.
+  SessionLoggingManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Permissions for managed nodes to deliver encrypted session transcripts to S3 and stream session logs to CloudWatch Logs. Attached to managed-node roles by the session-logging State Manager association.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SSMSessionLogging
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetEncryptionConfiguration
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:Encrypt
+            Resource:
+              - !GetAtt SessionTranscriptBucket.Arn
+              - !Sub '${SessionTranscriptBucket.Arn}/*'
+              - !GetAtt EncryptionKey.Arn
+          - Sid: CloudWatchEncryptedLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${SessionLogGroup}:*'
+          - Sid: CloudWatchDescribeGroups
+            Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+  # Execution role for the reconciliation runbook. It can attach ONLY the
+  # SessionLoggingManagedPolicy (iam:PolicyARN condition), and only to roles
+  # in this account — it cannot attach any other policy, so it is not a
+  # privilege-escalation path.
+  SessionLoggingAutomationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allows the session-logging automation to discover managed nodes and attach only the session-logging policy to their roles.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # ssm:DescribeInstanceInformation and ec2:DescribeInstances are
+          # account-wide list/describe operations that do not support
+          # resource-level permissions, so Resource must be '*'.
+          - Sid: DiscoverManagedNodes
+            Effect: Allow
+            Action:
+              - ssm:DescribeInstanceInformation
+              - ec2:DescribeInstances
+            Resource: '*'
+          # iam:GetInstanceProfile is scoped to instance profiles in this account
+          # so the automation can resolve an EC2 instance's role.
+          - Sid: ReadInstanceProfiles
+            Effect: Allow
+            Action: iam:GetInstanceProfile
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
+          - Sid: AttachOnlySessionLoggingPolicy
+            Effect: Allow
+            Action: iam:AttachRolePolicy
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+            Condition:
+              ArnEquals:
+                iam:PolicyARN: !Ref SessionLoggingManagedPolicy
+
+  SessionLoggingAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for the SSM Automation runbook that attaches the session-logging policy to managed-node roles.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SessionLoggingAutomationPolicy
+
+  # Automation runbook: discovers managed nodes, resolves each node's IAM role
+  # (EC2 instance-profile role or hybrid/DHMC IamRole), and attaches the policy.
+  # Idempotent — re-attaching an already-attached policy is a no-op.
+  SessionLoggingRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: Attaches the session-logging managed policy to every managed node's IAM role.
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: ARN of the role the automation assumes.
+          PolicyArn:
+            type: String
+            description: ARN of the session-logging managed policy to attach.
+        mainSteps:
+          - name: attachLoggingPolicy
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: handler
+              InputPayload:
+                PolicyArn: '{{ PolicyArn }}'
+              Script: |
+                import boto3
+
+                def handler(events, context):
+                    policy_arn = events['PolicyArn']
+                    ssm = boto3.client('ssm')
+                    ec2 = boto3.client('ec2')
+                    iam = boto3.client('iam')
+
+                    roles = set()
+                    paginator = ssm.get_paginator('describe_instance_information')
+                    for page in paginator.paginate():
+                        for info in page.get('InstanceInformationList', []):
+                            iam_role = info.get('IamRole') or ''
+                            instance_id = info.get('InstanceId', '')
+                            if iam_role:
+                                # DHMC-managed EC2 or hybrid activation role (name or ARN)
+                                roles.add(iam_role.split('/')[-1])
+                            elif instance_id.startswith('i-'):
+                                try:
+                                    resp = ec2.describe_instances(InstanceIds=[instance_id])
+                                    for res in resp.get('Reservations', []):
+                                        for inst in res.get('Instances', []):
+                                            prof = inst.get('IamInstanceProfile')
+                                            if not prof:
+                                                continue
+                                            prof_name = prof['Arn'].split('/')[-1]
+                                            gp = iam.get_instance_profile(InstanceProfileName=prof_name)
+                                            for role in gp['InstanceProfile'].get('Roles', []):
+                                                roles.add(role['RoleName'])
+                                except Exception as exc:
+                                    print('skip %s: %s' % (instance_id, exc))
+
+                    attached = []
+                    for role_name in sorted(roles):
+                        try:
+                            iam.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+                            attached.append(role_name)
+                        except Exception as exc:
+                            print('attach failed for %s: %s' % (role_name, exc))
+
+                    return {'rolesFound': sorted(roles), 'rolesAttached': attached}
+
+  # State Manager association: runs the runbook on a schedule so current and
+  # future managed nodes are granted the logging permissions automatically.
+  SessionLoggingAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: ssm-session-logging-permission-grant
+      Name: !Ref SessionLoggingRunbook
+      ScheduleExpression: !Ref RolePermissionAutomationSchedule
+      Parameters:
+        AutomationAssumeRole:
+          - !GetAtt SessionLoggingAutomationRole.Arn
+        PolicyArn:
+          - !Ref SessionLoggingManagedPolicy
+
 Outputs:
   TranscriptBucketName:
     Description: S3 bucket where Session Manager writes each session transcript; a PutObject event triggers the Module 1 analyzer Lambda.
@@ -1394,30 +1581,3 @@ Outputs:
   AgentCoreGatewayId:
     Description: AgentCore gateway that routes the harness's tool calls to the Module 2 query Lambda.
     Value: !Ref AgentCoreGateway
-
-  InstanceRolePolicySnippet:
-    Description: Attach this policy snippet to your managed-node IAM roles to grant the S3, KMS, and CloudWatch access needed to stream and store session transcripts.
-    Value: !Sub |
-      {
-        "Version": "2012-10-17",
-        "Statement": [
-          {
-            "Sid": "SSMSessionLogging",
-            "Effect": "Allow",
-            "Action": ["s3:PutObject", "s3:GetEncryptionConfiguration", "kms:GenerateDataKey*", "kms:Decrypt", "kms:Encrypt"],
-            "Resource": ["${SessionTranscriptBucket.Arn}", "${SessionTranscriptBucket.Arn}/*", "${EncryptionKey.Arn}"]
-          },
-          {
-            "Sid": "CloudWatchEncryptedLogs",
-            "Effect": "Allow",
-            "Action": ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
-            "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ssm/session-logs:*"
-          },
-          {
-            "Sid": "CloudWatchDescribeGroups",
-            "Effect": "Allow",
-            "Action": "logs:DescribeLogGroups",
-            "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
-          }
-        ]
-      }

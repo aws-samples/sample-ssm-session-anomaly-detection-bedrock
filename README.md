@@ -4,8 +4,6 @@ This sample shows how to automatically analyze AWS Systems Manager Session Manag
 
 This repository accompanies the AWS blog post [AI-powered anomaly detection for AWS Systems Manager Session Manager logs](<BLOG_POST_URL>).
 
-> **Note:** This is sample code for educational purposes. Review and test it in a non-production account before any production use.
-
 ## How it works
 
 The solution has two modules.

@@ -12,9 +12,14 @@ The solution has two modules. Module 1 analyzes each session automatically when 
 
 ## Prerequisites
 
-- An AWS account with permissions to deploy AWS CloudFormation stacks.
-- Access to an Amazon Bedrock foundation model (for example, Claude Haiku 4.5). See [Add or remove access to Amazon Bedrock foundation models](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
-- At least one managed node configured for Session Manager. See [Setting up Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html).
+Before you deploy this solution, verify that you have the following:
+•	An AWS account with permissions to deploy AWS CloudFormation stacks
+•	At least one managed node (Amazon EC2 instance or hybrid-activated server) with AWS Systems Manager Agent (SSM Agent) installed
+•	Access to an Amazon Bedrock foundation model (Claude Haiku 4.5 or your preferred model). For instructions, see Add or remove access to Amazon Bedrock foundation models.
+
+Note: Amazon Your managed nodes must be set up for Session Manager. That means the SSM Agent is installed, the node has an IAM role with the required permissions, and it has network access to the Systems Manager and Amazon
+  S3 endpoints. Recent Amazon EC2 Amazon Linux and Windows AMIs already include the SSM Agent. For on-premises nodes and the full network and setup steps, see Setting Up Session Manager
+
 
 ## Deploy
 

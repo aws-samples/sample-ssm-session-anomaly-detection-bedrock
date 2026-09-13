@@ -139,8 +139,8 @@ Resources:
   # Receives S3 server access logs from the transcript bucket for audit purposes
   LoggingBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Metadata:
       guard:
         SuppressedRules:
@@ -199,27 +199,26 @@ Resources:
                 'aws:SourceAccount': !Ref 'AWS::AccountId'
 
   # ============================================================
-  # S3 Bucket — Session transcripts (Object Lock + Versioning + KMS)
+  # S3 Bucket — Session transcripts (Versioning + KMS, no Object Lock)
   # ============================================================
   # ============================================================
-  # Stores session transcript files uploaded by SSM Agent when a session ends, triggering the analysis pipeline
+  # Stores session transcript files uploaded by SSM Agent when a session ends, triggering the analysis pipeline.
+  # Objects are retained indefinitely (no lifecycle expiration) so raw transcripts remain available at any age.
+  # Access is restricted to the solution roles; there is no Object Lock (see README for the tamper-proofing trade-off).
   SessionTranscriptBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Metadata:
       guard:
         SuppressedRules:
+          # Object Lock intentionally not used (see design notes). Access is restricted to the
+          # solution roles via IAM + bucket policy, and versioning is enabled; WORM immutability
+          # is deliberately out of scope for this sample, so this deviation is expected.
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
           - S3_BUCKET_NO_PUBLIC_RW_ACL
           - S3_BUCKET_SSL_REQUESTS_ONLY
     Properties:
-      ObjectLockEnabled: true
-      ObjectLockConfiguration:
-        ObjectLockEnabled: Enabled
-        Rule:
-          DefaultRetention:
-            Mode: GOVERNANCE
-            Days: 30
       VersioningConfiguration:
         Status: Enabled
       BucketEncryption:
@@ -239,13 +238,6 @@ Resources:
       LoggingConfiguration:
         DestinationBucketName: !Ref LoggingBucket
         LogFilePrefix: session-logs-access/
-      LifecycleConfiguration:
-        Rules:
-          - Id: ExpireOldTranscripts
-            Status: Enabled
-            ExpirationInDays: 30
-            NoncurrentVersionExpiration:
-              NoncurrentDays: 30
 
   # ============================================================
   # S3 Bucket Policy — HTTPS only (uses !Ref for scanner cross-reference)
@@ -360,11 +352,17 @@ Resources:
                           }
                       )
                   elif event['RequestType'] == 'Delete':
-                      bucket = event['ResourceProperties']['BucketName']
-                      s3.put_bucket_notification_configuration(
-                          Bucket=bucket,
-                          NotificationConfiguration={}
-                      )
+                      # Best-effort: the bucket is removed with the stack, so clearing its
+                      # notification config is optional. Tolerate a transient S3 conflict
+                      # (OperationAborted) or an already-deleted bucket so teardown never fails.
+                      try:
+                          bucket = event['ResourceProperties']['BucketName']
+                          s3.put_bucket_notification_configuration(
+                              Bucket=bucket,
+                              NotificationConfiguration={}
+                          )
+                      except Exception as de:
+                          print(f"Delete cleanup skipped: {de}")
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
               except Exception as e:
                   print(f"Error: {e}")
@@ -383,6 +381,12 @@ Resources:
 
   SessionAnalyzerS3Permission:
     Type: AWS::Lambda::Permission
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Not public: Principal is the fixed AWS service s3.amazonaws.com, scoped to this stack's
+          # transcript bucket (SourceArn) in this account (SourceAccount). No wildcard principal.
+          - LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED
     Properties:
       FunctionName: !Ref SessionAnalyzerFunction
       Action: 'lambda:InvokeFunction'
@@ -396,9 +400,14 @@ Resources:
   # Receives real-time session command streams from SSM Agent for on-demand log queries
   SessionLogGroup:
     Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Session logs are retained indefinitely by design (no RetentionInDays) so Module 2
+          # can query historic sessions at any age. Unbounded retention is intentional here.
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK
     Properties:
       LogGroupName: /aws/ssm/session-logs
-      RetentionInDays: 30
       KmsKeyId: !GetAtt EncryptionKey.Arn
 
   # ============================================================
@@ -842,6 +851,7 @@ Resources:
               table.put_item(Item={
                   'sessionId': session_id,
                   'timestamp': datetime.now(timezone.utc).isoformat(),
+                  'itemType': 'SUMMARY',
                   'user': user, 'target': target, 'sourceIp': source_ip,
                   'classification': analysis.get('classification', 'Unknown'),
                   'summary': analysis.get('summary', ''),
@@ -996,7 +1006,9 @@ Resources:
                       params[p['name']] = p['value']
               else:
                   params = event
-                  if 'query' in params:
+                  if 'sessionId' in params:
+                      api_path = '/get-session-api-calls'
+                  elif 'query' in params:
                       api_path = '/query-sessions'
                   elif 'username' in params:
                       api_path = '/search-user'
@@ -1013,6 +1025,8 @@ Resources:
                   result = search_user_sessions(params)
               elif api_path == '/lookup-cloudtrail':
                   result = lookup_cloudtrail(params)
+              elif api_path == '/get-session-api-calls':
+                  result = get_session_api_calls(params)
               else:
                   result = {"error": f"Unknown path: {api_path}"}
 
@@ -1058,9 +1072,9 @@ Resources:
               try:
                   scan_params = {
                       'TableName': TABLE_NAME,
-                      'FilterExpression': '#ts > :cutoff',
-                      'ExpressionAttributeNames': {'#ts': 'timestamp'},
-                      'ExpressionAttributeValues': {':cutoff': {'S': cutoff}}
+                      'FilterExpression': '#ts > :cutoff AND #it = :it',
+                      'ExpressionAttributeNames': {'#ts': 'timestamp', '#it': 'itemType'},
+                      'ExpressionAttributeValues': {':cutoff': {'S': cutoff}, ':it': {'S': 'SUMMARY'}}
                   }
                   if classification:
                       scan_params['FilterExpression'] += ' AND classification = :cls'
@@ -1091,9 +1105,9 @@ Resources:
               try:
                   response = dynamodb_client.scan(
                       TableName=TABLE_NAME,
-                      FilterExpression='contains(#u, :user) AND #ts > :cutoff',
-                      ExpressionAttributeNames={'#u': 'user', '#ts': 'timestamp'},
-                      ExpressionAttributeValues={':user': {'S': username}, ':cutoff': {'S': cutoff}}
+                      FilterExpression='contains(#u, :user) AND #ts > :cutoff AND #it = :it',
+                      ExpressionAttributeNames={'#u': 'user', '#ts': 'timestamp', '#it': 'itemType'},
+                      ExpressionAttributeValues={':user': {'S': username}, ':cutoff': {'S': cutoff}, ':it': {'S': 'SUMMARY'}}
                   )
                   items = []
                   for item in response.get('Items', []):
@@ -1142,6 +1156,42 @@ Resources:
                           'responseElements': json.dumps(detail.get('responseElements', {}))[:200]
                       })
                   return {"status": "success", "resultCount": len(events), "events": events}
+              except Exception as e:
+                  return {"error": type(e).__name__}
+
+
+          def get_session_api_calls(params):
+              # Return the CloudTrail API events captured for a session, straight from DynamoDB.
+              # This works for a session of ANY age (no 90-day limit), because Module 1 stored the
+              # events at analysis time. Each event is its own item (SK begins with "APICALL#").
+              session_id = params.get('sessionId', '')
+              if not session_id:
+                  return {"error": "Missing 'sessionId' parameter"}
+              try:
+                  response = dynamodb_client.query(
+                      TableName=TABLE_NAME,
+                      KeyConditionExpression='sessionId = :sid AND begins_with(#ts, :pfx)',
+                      ExpressionAttributeNames={'#ts': 'timestamp'},
+                      ExpressionAttributeValues={':sid': {'S': session_id}, ':pfx': {'S': 'APICALL#'}}
+                  )
+                  events = []
+                  for item in response.get('Items', []):
+                      events.append({
+                          'eventName': item.get('eventName', {}).get('S', ''),
+                          'eventTime': item.get('eventTime', {}).get('S', ''),
+                          'eventSource': item.get('eventSource', {}).get('S', ''),
+                          'awsRegion': item.get('awsRegion', {}).get('S', ''),
+                          'sourceIp': item.get('sourceIp', {}).get('S', ''),
+                          'userArn': item.get('userArn', {}).get('S', ''),
+                          'userName': item.get('userName', {}).get('S', ''),
+                          'userType': item.get('userType', {}).get('S', ''),
+                          'userAgent': item.get('userAgent', {}).get('S', ''),
+                          'eventId': item.get('eventId', {}).get('S', ''),
+                          'requestParameters': item.get('requestParameters', {}).get('S', ''),
+                          'errorCode': item.get('errorCode', {}).get('S', '')
+                      })
+                  events.sort(key=lambda e: e['eventTime'])
+                  return {"status": "success", "sessionId": session_id, "resultCount": len(events), "apiCalls": events}
               except Exception as e:
                   return {"error": type(e).__name__}
 
@@ -1253,6 +1303,16 @@ Resources:
                       hoursBack:
                         Type: string
                         Description: Hours of history to search (default 168)
+                - Name: getSessionApiCalls
+                  Description: Get the AWS API calls (StartSession, ResumeSession, TerminateSession) captured for a specific SSM session, read from DynamoDB. Works for sessions of any age with no 90-day limit. Use this when asked what API calls or actions occurred during a given sessionId.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      sessionId:
+                        Type: string
+                        Description: The SSM Session Manager session ID to return captured API calls for
+                    Required:
+                      - sessionId
                 - Name: searchUserSessions
                   Description: Search session summaries for a specific user.
                   InputSchema:
@@ -1358,6 +1418,12 @@ Resources:
             When presenting results, highlight any security-relevant findings and recommend follow-up actions. Present all results directly in the chat response. Do not create files or write reports to disk. When reporting a session's severity, use the exact classification value returned by the tools (Normal, Suspicious, or Critical) - do not upgrade or downgrade it. You may add analysis and context, but the severity label you show must match the stored classification.
 
             Base your factual statements on data returned by your tools (querySessions, getSummaries, searchUserSessions, lookupCloudTrail). You may analyze, interpret, correlate, and draw security conclusions from that data, and recommend follow-up actions. Do not fabricate raw data the tools did not return - do not invent metrics, values, hostnames, timestamps, command output, or "expected" or "example" results. If the specific information an analyst asks for is not present in the results, say so plainly instead of filling the gap with generated content.
+
+            When an analyst names a specific session ID, always call a tool to retrieve that exact session before answering, even if you discussed a session earlier in the conversation. Do not answer about a named session from memory or prior context. For the AWS API calls captured for a specific session, use the getSessionApiCalls tool with that session ID. After a tool returns, confirm the session ID in the result matches the session the analyst asked about; if it does not, say so rather than presenting data for a different session.
+
+            Describe actions only at the level the evidence supports. Distinguish an attempted action from a successful one: if the raw logs show a command failed, was refused, or returned an error or empty output, report it as attempted or failed, not successful. Distinguish accessing or reading data on the host from exfiltrating it: reading a file such as /etc/shadow is credential access, not exfiltration, unless the logs show the data was transmitted off the host. Do not state that credentials were retrieved, extracted, or exfiltrated unless the tool output actually contains the returned credential data or clear evidence of transfer.
+
+            The lookupCloudTrail tool can return session events that have no matching summary in getSummaries and no logs in querySessions, because CloudTrail history is account-wide and can cover sessions outside this solution's stored data. If an analyst asks you to investigate such a session and no summary or log data is returned for it, state that no stored session data is available for that session rather than implying it can be examined.
 
             You must not use any shell, terminal, code-execution, or file tool, even if one appears available to you. Never create, write, save, generate, or edit any file, report, document, or package, and never state or imply that you have done so. Do not provide, offer, or hint at downloading, exporting, or transferring anything: no file paths, no scp or download commands, no "downloadable" or "saved to" language, and no offers to generate a report or file as a follow-up.
 
@@ -1540,6 +1606,377 @@ Resources:
           - !GetAtt SessionLoggingAutomationRole.Arn
         PolicyArn:
           - !Ref SessionLoggingManagedPolicy
+
+  # ============================================================
+  # Event-driven API-call capture (Module 1)
+  # An EventBridge rule fires on the session's own CloudTrail management events
+  # (delivered natively to EventBridge — no trail required) the moment they land,
+  # so capture is deterministic and correctly scoped to the event's own sessionId
+  # (no propagation-lag misses, no cross-session contamination).
+  # ============================================================
+  SessionApiCaptureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for the event-driven Lambda that captures per-session SSM API calls into DynamoDB.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  SessionApiCapturePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_POLICYDOCUMENT_NO_WILDCARD_RESOURCE
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: >-
+              Logging uses the standard /aws/lambda/* log-group scope. DynamoDB and
+              KMS permissions are scoped to this stack's table and key.
+    Properties:
+      Roles:
+        - !Ref SessionApiCaptureRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaLogging
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Sid: DynamoDBWriteAndBackfill
+            Effect: Allow
+            Action:
+              - 'dynamodb:PutItem'
+              - 'dynamodb:Query'
+              - 'dynamodb:UpdateItem'
+            Resource: !GetAtt SessionSummaryTable.Arn
+          - Sid: KMSForEncryptedTable
+            Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: !GetAtt EncryptionKey.Arn
+          - Sid: DLQSend
+            Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt AnalyzerDLQ.Arn
+
+  SessionApiCaptureFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SessionApiCapturePolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt SessionApiCaptureRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt AnalyzerDLQ.Arn
+      Tags:
+        - Key: NetworkPlacement
+          Value: public-endpoint-only
+      Environment:
+        Variables:
+          SUMMARY_TABLE: !Ref SessionSummaryTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          dynamodb = boto3.client('dynamodb')
+          TABLE_NAME = os.environ['SUMMARY_TABLE']
+
+
+          def _s(v):
+              return {'S': str(v)}
+
+
+          def handler(event, context):
+              # EventBridge delivers one SSM session CloudTrail event. The sessionId comes
+              # from the event itself, so the APICALL item attaches to exactly the right
+              # session (no target guessing, no cross-session contamination).
+              detail = event.get('detail', {}) or {}
+              name = detail.get('eventName', '')
+              req = detail.get('requestParameters') or {}
+              resp = detail.get('responseElements') or {}
+              session_id = req.get('sessionId') or resp.get('sessionId')
+              if not session_id:
+                  print(f"No sessionId in {name} event; skipping")
+                  return {'stored': 0}
+
+              ui = detail.get('userIdentity', {}) or {}
+              event_id = detail.get('eventID', '')
+              event_time = detail.get('eventTime', '')
+              source_ip = detail.get('sourceIPAddress', 'unknown')
+
+              item = {
+                  'sessionId': _s(session_id),
+                  'timestamp': _s(f"APICALL#{event_time}#{event_id}"),
+                  'itemType': _s('APICALL'),
+                  'eventName': _s(name),
+                  'eventTime': _s(event_time),
+                  'eventSource': _s(detail.get('eventSource', '')),
+                  'awsRegion': _s(detail.get('awsRegion', '')),
+                  'sourceIp': _s(source_ip),
+                  'userAgent': _s(str(detail.get('userAgent', ''))[:512]),
+                  'userArn': _s(ui.get('arn', '')),
+                  'userType': _s(ui.get('type', '')),
+                  'principalId': _s(ui.get('principalId', '')),
+                  'accountId': _s(ui.get('accountId', '')),
+                  'userName': _s(ui.get('userName', ui.get('arn', '').split('/')[-1])),
+                  'eventId': _s(event_id),
+                  'requestParameters': _s(json.dumps(req)[:2048])
+              }
+              err = detail.get('errorCode')
+              if err:
+                  item['errorCode'] = _s(str(err)[:256])
+                  item['errorMessage'] = _s(str(detail.get('errorMessage', ''))[:512])
+              try:
+                  dynamodb.put_item(TableName=TABLE_NAME, Item=item)
+                  print(f"Stored APICALL item for session {session_id} ({name})")
+              except Exception as e:
+                  print(f"Failed to store APICALL item: {type(e).__name__}")
+
+              # Best-effort: backfill the summary's sourceIp if the summary exists and is unknown.
+              if source_ip and source_ip != 'unknown':
+                  try:
+                      q = dynamodb.query(
+                          TableName=TABLE_NAME,
+                          KeyConditionExpression='sessionId = :s',
+                          FilterExpression='#it = :it',
+                          ExpressionAttributeNames={'#it': 'itemType'},
+                          ExpressionAttributeValues={':s': _s(session_id), ':it': _s('SUMMARY')}
+                      )
+                      for it in q.get('Items', []):
+                          if it.get('sourceIp', {}).get('S', 'unknown') in ('', 'unknown'):
+                              dynamodb.update_item(
+                                  TableName=TABLE_NAME,
+                                  Key={'sessionId': it['sessionId'], 'timestamp': it['timestamp']},
+                                  UpdateExpression='SET sourceIp = :ip',
+                                  ExpressionAttributeValues={':ip': _s(source_ip)}
+                              )
+                              print(f"Backfilled sourceIp for summary of {session_id}")
+                  except Exception as e:
+                      print(f"sourceIp backfill skipped: {type(e).__name__}")
+              return {'stored': 1}
+
+  SessionApiCaptureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Fires on SSM Session Manager lifecycle API calls so their details are captured per session.
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ssm.amazonaws.com
+          eventName:
+            - StartSession
+            - ResumeSession
+            - TerminateSession
+      State: ENABLED
+      Targets:
+        - Id: SessionApiCaptureTarget
+          Arn: !GetAtt SessionApiCaptureFunction.Arn
+
+  SessionApiCapturePermission:
+    Type: AWS::Lambda::Permission
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Not public: Principal is the fixed AWS service events.amazonaws.com, scoped to this stack's
+          # specific EventBridge rule (SourceArn) in this account (SourceAccount). No wildcard principal.
+          - LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED
+    Properties:
+      FunctionName: !Ref SessionApiCaptureFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SessionApiCaptureRule.Arn
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # ============================================================
+  # Teardown Cleanup — empties both S3 buckets and detaches the
+  # session-logging policy on stack deletion, so a single delete-stack
+  # removes everything with no manual steps. No Object Lock is in use,
+  # so no bypass-governance permission is required.
+  # ============================================================
+  TeardownCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Execution role for the teardown cleanup custom resource that empties the S3 buckets and detaches the session-logging policy on stack deletion.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  # This policy can detach ONLY the SessionLoggingManagedPolicy (iam:PolicyARN
+  # condition) and delete objects ONLY in this stack's two buckets. It cannot
+  # touch any other policy, role, or bucket, so it is not a privilege-escalation
+  # or broad-deletion path.
+  TeardownCleanupPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_POLICYDOCUMENT_NO_WILDCARD_RESOURCE
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: >-
+              iam:DetachRolePolicy is constrained by an iam:PolicyARN condition to
+              the single session-logging policy, and logging uses the standard
+              /aws/lambda/* log-group scope. No broader access is granted.
+    Properties:
+      Roles:
+        - !Ref TeardownCleanupRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaLogging
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Sid: DLQSend
+            Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt AnalyzerDLQ.Arn
+          - Sid: EmptyBuckets
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+              - 's3:ListBucketVersions'
+              - 's3:GetBucketVersioning'
+              - 's3:DeleteObject'
+              - 's3:DeleteObjectVersion'
+            Resource:
+              - !GetAtt SessionTranscriptBucket.Arn
+              - !Sub '${SessionTranscriptBucket.Arn}/*'
+              - !GetAtt LoggingBucket.Arn
+              - !Sub '${LoggingBucket.Arn}/*'
+          - Sid: ListPolicyEntities
+            Effect: Allow
+            Action: iam:ListEntitiesForPolicy
+            Resource: !Ref SessionLoggingManagedPolicy
+          - Sid: DetachOnlySessionLoggingPolicy
+            Effect: Allow
+            Action: iam:DetachRolePolicy
+            Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+            Condition:
+              ArnEquals:
+                iam:PolicyARN: !Ref SessionLoggingManagedPolicy
+
+  TeardownCleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TeardownCleanupPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt TeardownCleanupRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt AnalyzerDLQ.Arn
+      Tags:
+        - Key: NetworkPlacement
+          Value: public-endpoint-only
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+          iam = boto3.client('iam')
+
+
+          def empty_bucket(bucket):
+              # Delete all object versions and delete markers so CloudFormation can remove the bucket.
+              paginator = s3.get_paginator('list_object_versions')
+              for page in paginator.paginate(Bucket=bucket):
+                  objects = [{'Key': v['Key'], 'VersionId': v['VersionId']}
+                             for v in page.get('Versions', []) + page.get('DeleteMarkers', [])]
+                  for i in range(0, len(objects), 1000):
+                      batch = objects[i:i + 1000]
+                      if batch:
+                          s3.delete_objects(Bucket=bucket, Delete={'Objects': batch, 'Quiet': True})
+
+
+          def detach_policy(policy_arn):
+              # Detach the session-logging policy from every role it is attached to.
+              paginator = iam.get_paginator('list_entities_for_policy')
+              for page in paginator.paginate(PolicyArn=policy_arn, EntityFilter='Role'):
+                  for role in page.get('PolicyRoles', []):
+                      try:
+                          iam.detach_role_policy(RoleName=role['RoleName'], PolicyArn=policy_arn)
+                      except Exception as e:
+                          print(f"Detach skipped for {role.get('RoleName')}: {type(e).__name__}")
+
+
+          def handler(event, context):
+              # Only act on Delete; Create/Update are no-ops. Always report SUCCESS on Delete
+              # (best effort) so a transient error never wedges the stack deletion.
+              try:
+                  if event['RequestType'] == 'Delete':
+                      props = event.get('ResourceProperties', {})
+                      policy_arn = props.get('ManagedPolicyArn')
+                      if policy_arn:
+                          try:
+                              detach_policy(policy_arn)
+                          except Exception as e:
+                              print(f"detach_policy error: {type(e).__name__}")
+                      for prop in ('TranscriptBucket', 'LoggingBucket'):
+                          bucket = props.get(prop)
+                          if bucket:
+                              try:
+                                  empty_bucket(bucket)
+                              except Exception as e:
+                                  print(f"empty_bucket error for {bucket}: {type(e).__name__}")
+              except Exception as e:
+                  print(f"Cleanup error: {type(e).__name__}")
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  # Deleted BEFORE the buckets and the managed policy (reverse dependency order),
+  # so it empties/detaches them first and CloudFormation can then remove them.
+  TeardownCleanup:
+    Type: Custom::TeardownCleanup
+    DependsOn:
+      - SessionTranscriptBucket
+      - LoggingBucket
+      - SessionLoggingManagedPolicy
+      - SessionLoggingAssociation
+    Properties:
+      ServiceToken: !GetAtt TeardownCleanupFunction.Arn
+      TranscriptBucket: !Ref SessionTranscriptBucket
+      LoggingBucket: !Ref LoggingBucket
+      ManagedPolicyArn: !Ref SessionLoggingManagedPolicy
 
 Outputs:
   TranscriptBucketName:

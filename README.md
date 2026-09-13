@@ -2,13 +2,14 @@
 
 This sample shows how to automatically analyze AWS Systems Manager Session Manager transcripts using Amazon Bedrock. It classifies each session, alerts your security team on suspicious activity, and lets analysts query session history in natural language through Amazon Bedrock AgentCore.
 
-This repository accompanies the AWS blog post [AI-powered anomaly detection for AWS Systems Manager Session Manager logs](<BLOG_POST_URL>).
-
 > **Note:** This is sample code for demonstration and learning. Review and adapt it before using it in production. As part of deployment, the solution attaches an IAM policy to your managed node roles automatically through an AWS Systems Manager State Manager association.
 
 ## How it works
 
-The solution has two modules. Module 1 analyzes each session automatically when it ends: it reads the transcript from Amazon S3, looks up the initiating identity and source IP in AWS CloudTrail, classifies the session with Amazon Bedrock (Normal, Suspicious, or Critical), stores a summary in Amazon DynamoDB, and sends an Amazon SNS alert for Suspicious or Critical sessions. Module 2 lets your Security Operations Center (SOC) team query session history on demand, in plain language, through an Amazon Bedrock AgentCore harness backed by Amazon DynamoDB, Amazon CloudWatch Logs, and AWS CloudTrail. Together they cover both automatic detection and hands-on investigation.
+The solution has two modules.
+
+- **Module 1 (automatic analysis).** When a session ends, Session Manager uploads the transcript to Amazon S3. An AWS Lambda function reads it, looks up the initiating identity and source IP in AWS CloudTrail, sends the content to Amazon Bedrock for classification (Normal, Suspicious, or Critical), stores a summary in Amazon DynamoDB, and publishes an Amazon SNS alert for Suspicious or Critical sessions. In parallel, an Amazon EventBridge rule captures the session's own Systems Manager API calls (StartSession, ResumeSession, TerminateSession) into DynamoDB as they occur, so per-session API context is available later.
+- **Module 2 (on-demand querying).** An Amazon Bedrock AgentCore harness answers natural-language questions about session history. It calls a query executor Lambda function through an AgentCore gateway, which reads from Amazon DynamoDB, Amazon CloudWatch Logs, and AWS CloudTrail.
 
 ## Prerequisites
 
@@ -16,9 +17,9 @@ Before you deploy this solution, verify that you have the following:
 
 - An AWS account with permissions to deploy AWS CloudFormation stacks.
 - At least one managed node (Amazon EC2 instance or hybrid-activated server) with the SSM Agent installed and an IAM role that has the `AmazonSSMManagedInstanceCore` managed policy. The solution grants the additional session-logging permissions for you (see [How managed nodes get logging permissions](#how-managed-nodes-get-logging-permissions)).
-- Access to an Amazon Bedrock foundation model (Claude Haiku 4.5 or your preferred model). For instructions, see [Add or remove access to Amazon Bedrock foundation models](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
+- Access to an Amazon Bedrock foundation model (Claude Haiku 4.5 or your preferred model). See [Add or remove access to Amazon Bedrock foundation models](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html).
 
-Your managed nodes must be set up for Session Manager. That means the SSM Agent is installed, the node role has the required permissions, and the node has network access to the Systems Manager and Amazon S3 endpoints. Recent Amazon EC2 Amazon Linux and Windows AMIs already include the SSM Agent. For on-premises nodes and the full network and setup steps, see [Setting up Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html).
+Your managed nodes must be set up for Session Manager. That means the SSM Agent is installed, the node role has the required permissions, and the node has network access to the Systems Manager and Amazon S3 endpoints. Recent Amazon EC2 Amazon Linux and Windows AMIs already include the SSM Agent. For on-premises nodes and the full setup steps, see [Setting up Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started.html).
 
 ## Deploy
 
@@ -55,15 +56,35 @@ The automation is scoped narrowly. It can attach only the one session-logging po
 
 The stack **Outputs** tab lists the transcript bucket name and ARN, the session log group, the summary table, the alert topic ARN, the KMS key ARN, both Lambda function ARNs, and the AgentCore harness ARN and gateway ID.
 
+## Query session history (Module 2)
+
+The stack creates the AgentCore gateway and the harness and connects them to the query executor Lambda function. To use it:
+
+1. Open the [Amazon Bedrock AgentCore console](https://console.aws.amazon.com/bedrock-agentcore/home).
+2. In the navigation pane, choose the harness.
+3. Open the harness named `SSMSecurityAnalyst` (the full name is in the stack Outputs under `AgentCoreHarnessArn`).
+
+Ask questions in plain language. The harness selects the right tool for each question:
+
+- **getSummaries** — session summaries from DynamoDB, optionally filtered by classification.
+- **searchUserSessions** — sessions for a specific user.
+- **querySessions** — raw command activity from CloudWatch Logs.
+- **getSessionApiCalls** — the captured API calls for a specific session, from DynamoDB, available for a session of any age.
+- **lookupCloudTrail** — recent AWS API activity from CloudTrail.
+
 ## Customize the classification
 
-The model reviews the full session transcript, not just the commands entered. It also considers command output, the order of actions, and the overall context of the session. You control this behavior through the classification prompt in the analyzer Lambda function. Edit that prompt to adjust the criteria for each category, add your own rules, or define categories that fit your operational needs. You can also change the `AnalysisModelId` parameter to use a different foundation model.
+The model reviews the full session transcript, not just the commands entered. It also considers command output, the order of actions, and the overall context of the session. You control this behavior through the classification prompt in the `SessionAnalyzerFunction` Lambda function. Edit that prompt to adjust the criteria for each category, add your own rules, or define categories that fit your operational needs. You can also change the `AnalysisModelId` parameter to use a different foundation model.
+
+## Data retention
+
+Session transcripts (Amazon S3) and session command logs (Amazon CloudWatch Logs) are retained indefinitely so Module 2 can query history at any age. The DynamoDB table has no TTL, so session summaries and captured API calls also persist. Adjust the S3 lifecycle and the log group retention if your environment needs a bounded retention period, and be aware that indefinite retention grows storage cost over time.
 
 ## Test
 
 **Module 1.** Start a Session Manager session, run a few commands, and check the summary table for a `Normal` classification. Start a second session, run unusual commands, and confirm you receive an alert.
 
-**Module 2.** Open the harness in the Amazon Bedrock AgentCore console, choose **Test Harness**, and ask a question in plain language, such as "Show me all suspicious sessions from the past 24 hours."
+**Module 2.** Open the harness in the Amazon Bedrock AgentCore console and ask a question in plain language, such as "Show me all suspicious sessions from the past 24 hours."
 
 ## Clean up
 
@@ -73,7 +94,7 @@ Delete the stack to remove all resources:
 aws cloudformation delete-stack --stack-name ssm-session-anomaly-detection
 ```
 
-Before deleting, detach the session-logging managed policy from any node roles it was attached to. The automation attaches this policy to your node roles, and a managed policy cannot be deleted while it is still attached, so the stack delete fails otherwise. If deletion is still blocked, empty the S3 buckets first, then delete the stack again.
+The stack deletion removes all resources automatically. A cleanup function empties both S3 buckets and detaches the session-logging policy from your managed node roles before the buckets and policy are deleted, so no manual steps are required.
 
 ## Security
 
